@@ -21,6 +21,10 @@ LogicalResult convertMMA(triton::instrument::DotI8Op op,
                          const LLVMTypeConverter *typeConverter,
                          ConversionPatternRewriter &rewriter, bool isTuring);
 
+LogicalResult convertMMA884(triton::DotOp op, triton::DotOp::Adaptor adaptor,
+                            const LLVMTypeConverter *typeConverter,
+                            ConversionPatternRewriter &rewriter);
+
 LogicalResult convertMMADotScaled(triton::DotScaledOp op,
                                   triton::DotScaledOp::Adaptor adaptor,
                                   const LLVMTypeConverter *typeConverter,
@@ -74,6 +78,8 @@ struct DotOpConversion : public ConvertOpToLLVMPattern<triton::DotOp> {
     NvidiaMmaEncodingAttr mmaLayout =
         dyn_cast<NvidiaMmaEncodingAttr>(dEncoding);
     if (mmaLayout) {
+      if (mmaLayout.isVolta())
+        return convertMMA884(op, adaptor, getTypeConverter(), rewriter);
       if (mmaLayout.getVersionMajor() == 2) {
         return convertMMA(op, adaptor, getTypeConverter(), rewriter,
                           mmaLayout.isTuring());
