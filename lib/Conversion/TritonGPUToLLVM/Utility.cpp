@@ -1712,16 +1712,23 @@ delinearize(RewriterBase &rewriter, Location loc,
   if (freeVarMask != 0) {
     isRepresentative =
         b.icmp_eq(b.and_(b.i32_val(freeVarMask), linear), b.i32_val(0));
-    // We remove the bits of linear that are set to one in freeVarMask
-    int32_t nonFreeVarMask = ~freeVarMask & (ll.getInDimSize(dimName) - 1);
-    linear = pext_i32(rewriter, loc, linear, nonFreeVarMask);
   }
 
-  auto linearLayout = triton::gpu::LinearEncodingAttr::get(
-      rewriter.getContext(), std::move(ll));
-  auto orderDim = linearLayout.orderPerDim(dimName, linearLayout.getOrder());
-  auto shapeDim = linearLayout.basesPerDim(dimName, /*skipBroadcast=*/true);
-  auto multiDim = delinearize(rewriter, loc, linear, shapeDim, orderDim);
+  // The index along each dim is made of the bits whose basis moves along that
+  // dim, in bit order. Unlike a mixed-radix split by order this also holds
+  // when a dim's bits are interleaved with other dims' bits (Volta's MMA
+  // layout puts rows on lane bits 0, 2, 4 and columns on 1, 3). Broadcast bits
+  // have a zero basis and belong to no dim.
+  const auto &bases = ll.getBases().lookup(dimName);
+  SmallVector<Value> multiDim;
+  for (unsigned dim = 0; dim < ll.getNumOutDims(); ++dim) {
+    uint32_t mask = 0;
+    for (auto [bit, basis] : llvm::enumerate(bases)) {
+      if (basis[dim] != 0)
+        mask |= 1u << bit;
+    }
+    multiDim.push_back(pext_i32(rewriter, loc, linear, mask));
+  }
 
   return std::make_tuple(std::move(multiDim), isRepresentative);
 }
