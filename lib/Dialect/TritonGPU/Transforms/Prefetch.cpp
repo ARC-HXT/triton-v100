@@ -86,7 +86,7 @@ class Prefetcher {
   DenseMap<Value, Value> initMaterializations;
 
   Value generatePrefetch(Value v, unsigned opIdx, bool isPrologue,
-                         Attribute dotEncoding, OpBuilder &builder,
+                         Attribute operandEncoding, OpBuilder &builder,
                          Value token = Value(),
                          std::optional<int64_t> offsetK = std::nullopt,
                          std::optional<int64_t> shapeK = std::nullopt);
@@ -162,8 +162,9 @@ void Prefetcher::cloneElementwiseOps(Value &ret, const SmallVector<Value> &vals,
 }
 
 Value Prefetcher::generatePrefetch(Value v, unsigned opIdx, bool isPrologue,
-                                   Attribute dotEncoding, OpBuilder &builder,
-                                   Value token, std::optional<int64_t> offsetK,
+                                   Attribute operandEncoding,
+                                   OpBuilder &builder, Value token,
+                                   std::optional<int64_t> offsetK,
                                    std::optional<int64_t> shapeK) {
   // opIdx: 0 => a, 1 => b
   auto type = cast<triton::gpu::MemDescType>(v.getType());
@@ -190,8 +191,15 @@ Value Prefetcher::generatePrefetch(Value v, unsigned opIdx, bool isPrologue,
           type.getMutableMemory(), type.getAllocShape()),
       v, offset);
 
-  auto dotOperandEnc = triton::gpu::DotOperandEncodingAttr::get(
-      builder.getContext(), opIdx, dotEncoding, prefetchWidth / 8);
+  // On Volta the slice keeps the operand's layout (its kWidth may differ
+  // between A and B); other targets use the kWidth of the prefetch chunk.
+  auto dotOperandEnc =
+      cast<triton::gpu::DotOperandEncodingAttr>(operandEncoding);
+  auto mmaParent = dyn_cast<NvidiaMmaEncodingAttr>(dotOperandEnc.getParent());
+  if (!(mmaParent && mmaParent.isVolta()))
+    dotOperandEnc = triton::gpu::DotOperandEncodingAttr::get(
+        builder.getContext(), opIdx, dotOperandEnc.getParent(),
+        prefetchWidth / 8);
   Value prefetchSlice = triton::gpu::LocalLoadOp::create(
       builder, v.getLoc(),
       RankedTensorType::get(shape, elementType, dotOperandEnc), newSmem, token);
@@ -477,13 +485,19 @@ LogicalResult Prefetcher::initialize() {
         mlir::cast<triton::gpu::DotOperandEncodingAttr>(bType.getEncoding());
     int aKWidth = aEnc.getKWidth();
     int bKWidth = bEnc.getKWidth();
-    assert(aKWidth == bKWidth);
+    // Volta operands hold four k values (kWidth 4) or four m/n values at one k
+    // (kWidth 1), independently for A and B; m8n8k4 consumes 4 k either way.
+    auto mmaParent = dyn_cast<NvidiaMmaEncodingAttr>(aEnc.getParent());
+    bool volta = mmaParent && mmaParent.isVolta();
+    assert(volta || aKWidth == bKWidth);
 
     auto kSize = aType.getShape().back();
 
-    // Match the chunk width expected by the dot operand encoding.
+    // Match the chunk width expected by the dot operand encoding; Volta
+    // operands are sliced in 32-wide k chunks whatever their kWidth.
     prefetchWidth =
-        getPrefetchWidth(dotEncoding, aType.getElementType(), aKWidth);
+        volta ? 32
+              : getPrefetchWidth(dotEncoding, aType.getElementType(), aKWidth);
 
     // Skip prefetching if kSize is less than prefetchWidth
     if (kSize < prefetchWidth)
@@ -524,16 +538,17 @@ void Prefetcher::emitPrologue() {
   OpBuilder builder(forOp);
 
   for (triton::DotOp dot : dots) {
-    Attribute dotEncoding = dot.getType().getEncoding();
+    Attribute aEncoding = dot.getA().getType().getEncoding();
+    Attribute bEncoding = dot.getB().getType().getEncoding();
     Value aPrefetched = generatePrefetch(
         materializeInitValue(dot2aSource[dot], builder, initMaterializations),
-        0, true, dotEncoding, builder,
+        0, true, aEncoding, builder,
         materializeInitValue(dot2aToken.lookup(dot), builder,
                              initMaterializations));
     cloneElementwiseOps(aPrefetched, dot2aVals[dot], builder);
     Value bPrefetched = generatePrefetch(
         materializeInitValue(dot2bSource[dot], builder, initMaterializations),
-        1, true, dotEncoding, builder,
+        1, true, bEncoding, builder,
         materializeInitValue(dot2bToken.lookup(dot), builder,
                              initMaterializations));
     cloneElementwiseOps(bPrefetched, dot2bVals[dot], builder);
@@ -594,7 +609,8 @@ void Prefetcher::cloneLoopBody(scf::ForOp newForOp, OpBuilder &builder,
     Operation *newOp = builder.clone(op, mapping);
     auto dot = dyn_cast<triton::DotOp>(&op);
     if (dot && dots.contains(dot)) {
-      Attribute dotEncoding = dot.getType().getEncoding();
+      Attribute aEncoding = dot.getA().getType().getEncoding();
+      Attribute bEncoding = dot.getB().getType().getEncoding();
       // First dot uses the values prefetched before entering the loop.
       Operation *firstDot = builder.clone(*dot, mapping);
       if (Value a = operand2headPrefetch.lookup(dot.getA()))
@@ -624,7 +640,7 @@ void Prefetcher::cloneLoopBody(scf::ForOp newForOp, OpBuilder &builder,
         Value aRem = generatePrefetch(
             getCurrentTrackedValue(dot, /*isA=*/true, /*isToken=*/false,
                                    newForOp, mapping, carriedArgs),
-            0, false, dotEncoding, builder,
+            0, false, aEncoding, builder,
             getCurrentTrackedValue(dot, /*isA=*/true, /*isToken=*/true,
                                    newForOp, mapping, carriedArgs),
             kOff, kShape);
@@ -632,7 +648,7 @@ void Prefetcher::cloneLoopBody(scf::ForOp newForOp, OpBuilder &builder,
         Value bRem = generatePrefetch(
             getCurrentTrackedValue(dot, /*isA=*/false, /*isToken=*/false,
                                    newForOp, mapping, carriedArgs),
-            1, false, dotEncoding, builder,
+            1, false, bEncoding, builder,
             getCurrentTrackedValue(dot, /*isA=*/false, /*isToken=*/true,
                                    newForOp, mapping, carriedArgs),
             kOff, kShape);
@@ -684,13 +700,14 @@ Prefetcher::createYieldValues(OpBuilder &builder, IRMapping &mapping,
       yieldValues.push_back(nextAToken);
     if (carriedArgs.b.contains(dot))
       yieldValues.push_back(nextBToken);
-    Attribute dotEncoding = dot.getType().getEncoding();
-    Value aToYield = generatePrefetch(nextASource, 0, true, dotEncoding,
-                                      builder, nextAToken);
+    Attribute aEncoding = dot.getA().getType().getEncoding();
+    Attribute bEncoding = dot.getB().getType().getEncoding();
+    Value aToYield = generatePrefetch(nextASource, 0, true, aEncoding, builder,
+                                      nextAToken);
     cloneElementwiseOps(aToYield, dot2aVals[dot], builder);
     yieldValues.push_back(aToYield);
-    Value bToYield = generatePrefetch(nextBSource, 1, true, dotEncoding,
-                                      builder, nextBToken);
+    Value bToYield = generatePrefetch(nextBSource, 1, true, bEncoding, builder,
+                                      nextBToken);
     cloneElementwiseOps(bToYield, dot2bVals[dot], builder);
     yieldValues.push_back(bToYield);
   }
