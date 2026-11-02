@@ -113,7 +113,11 @@ LogicalResult convertMMA884(triton::DotOp op, triton::DotOp::Adaptor adaptor,
   for (int k = 0; k < K; k += 4) {
     for (auto &[index, tile] : tiles) {
       auto &[origin, slots] = tile;
-      auto [batch, row, col] = origin;
+      // Plain variables: lambdas may capture structured bindings only from
+      // C++20 on.
+      int32_t batch = std::get<0>(origin);
+      int32_t row = std::get<1>(origin);
+      int32_t col = std::get<2>(origin);
       auto aAt = [&](int i) {
         return aValues.at(aRow ? Coord{batch, row, k + i}
                                : Coord{batch, (row + i) % aRows, k});
