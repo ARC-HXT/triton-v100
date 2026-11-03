@@ -220,6 +220,12 @@ int getNVIDIAComputeCapability(Operation *module);
 // resource (Turing has half of Volta's per SM).
 bool isPreAmpereNvidia(Operation *module);
 
+// Shared memory one CTA can use on an NVIDIA target before sm_80, the opt-in
+// maximum per block of the CUDA C++ Programming Guide (technical
+// specifications per compute capability): 96 KB on sm_70 and sm_72, 64 KB on
+// sm_75, 48 KB before Volta.
+int getPreAmpereNvidiaSharedMemorySize(Operation *module);
+
 // Read the amd target from the module attributes
 std::optional<StringRef> getAMDArch(Operation *module);
 
