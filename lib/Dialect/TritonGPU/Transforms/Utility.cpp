@@ -1078,6 +1078,16 @@ bool isPreAmpereNvidia(Operation *module) {
          getNVIDIAComputeCapability(module) < 80;
 }
 
+int getPreAmpereNvidiaSharedMemorySize(Operation *module) {
+  assert(isPreAmpereNvidia(module) && "NVIDIA target before sm_80 expected");
+  int capability = getNVIDIAComputeCapability(module);
+  if (capability >= 75)
+    return 64 * 1024;
+  if (capability >= 70)
+    return 96 * 1024;
+  return 48 * 1024;
+}
+
 std::optional<StringRef> getAMDArch(Operation *module) {
   StringAttr targetAttr =
       module->getAttrOfType<StringAttr>(triton::gpu::AttrTargetName);

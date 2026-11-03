@@ -696,6 +696,26 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
     }
   }
 
+  // Stage through shared memory only when the buffers fit the target: a loop
+  // that Triton 3.6 pipelines in registers must not stop compiling for lack of
+  // shared memory (128x128 bf16 tiles of two operands at num_stages 5 take
+  // 256 KB in four buffers). Otherwise every load stays pipelined in
+  // registers, as without the staging.
+  if (!asyncCopyAvailable) {
+    int64_t stagedBytes = 0;
+    for (auto &[op, asyncLoad] : asyncLoads) {
+      if (!asyncLoad.registerStaged)
+        continue;
+      auto type = cast<RankedTensorType>(asyncLoad.decode.staged.getType());
+      stagedBytes += asyncLoad.stageDiff * type.getNumElements() *
+                     type.getElementTypeBitWidth() / 8;
+    }
+    if (stagedBytes > getPreAmpereNvidiaSharedMemorySize(
+                          forOp->getParentOfType<ModuleOp>()))
+      asyncLoads.remove_if(
+          [](const auto &entry) { return entry.second.registerStaged; });
+  }
+
   // Convert scalar loads to be able to use async copy.
   for (auto op : scalarLoads) {
     convertScalarToTensorLoad(op, schedule, forOp);
