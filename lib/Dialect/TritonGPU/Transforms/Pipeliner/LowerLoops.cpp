@@ -593,6 +593,7 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
   // Without cp.async (NVIDIA before sm_80) loads are pipelined in registers.
   const bool asyncCopyAvailable =
       !isPreAmpereNvidia(forOp->getParentOfType<ModuleOp>());
+  DenseSet<Value> registerStagedValues;
   // Only visit the top level ops, we do not support pipelining conditional
   // loads for now
   for (auto &op : forOp.getBody()->without_terminator()) {
@@ -656,7 +657,15 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
         bool incompatible = false;
         auto dotEncoding =
             getSharedEncIfAllUsersAreDotEnc(decode.staged, incompatible);
-        if (dotEncoding && *dotEncoding) {
+        // One buffer per staged value. The decodes of several loads can end
+        // in the same value, e.g. a key tile scaled by a gate tile of its own
+        // shape, k * exp2(g): the first load stages it, and the others are
+        // side operands of its decode and run along in the copy's stage. A
+        // second copy of the same value would store the first buffer's view
+        // into its own buffer, so the dot would read a tile from an earlier
+        // iteration, before the first ones even uninitialized shared memory.
+        if (dotEncoding && *dotEncoding &&
+            registerStagedValues.insert(decode.staged).second) {
           auto &asyncLoad = asyncLoads[&op];
           asyncLoad.stageDiff = stageDiff;
           asyncLoad.sharedEncoding = *dotEncoding;

@@ -1,5 +1,7 @@
 # End-to-end tests to check the correctness of the pipeliner
 
+import re
+
 import pytest
 import torch
 import triton
@@ -575,3 +577,49 @@ def test_conditional_store_pipeline(num_stages, device):
     # Expected output: [1, 2, 3, 4, ..., N]
     expected = torch.arange(1, N + 1, dtype=torch.int32, device=device)
     assert torch.equal(output, expected)
+
+
+@triton.jit
+def converging_operand_matmul_kernel(a_ptr, x_ptr, y_ptr, out_ptr, K,  #
+                                     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,  #
+                                     NUM_STAGES: tl.constexpr, INPUT_PRECISION: tl.constexpr):
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k in tl.range(0, K, BLOCK_K, num_stages=NUM_STAGES):
+        a = tl.load(a_ptr + offs_m[:, None] * K + (k + offs_k)[None, :])
+        x = tl.load(x_ptr + (k + offs_k)[:, None] * BLOCK_N + offs_n[None, :])
+        y = tl.load(y_ptr + (k + offs_k)[:, None] * BLOCK_N + offs_n[None, :])
+        b = x.to(tl.float32) * tl.exp2(y.to(tl.float32))
+        acc += tl.dot(a, b.to(a.dtype), input_precision=INPUT_PRECISION)
+    tl.store(out_ptr + offs_m[:, None] * BLOCK_N + offs_n[None, :], acc)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+@pytest.mark.parametrize("num_warps", [1, 4])
+@pytest.mark.parametrize("num_stages", [2, 3, 4])
+def test_pipeline_converging_dot_operand(dtype, num_warps, num_stages, device):
+    # Two loads whose elementwise decode ends in the same dot operand, as a key
+    # tile scaled by a gate tile of its own shape. Before sm_80 the pipeliner
+    # stages such an operand through registers into shared memory, and it must
+    # get exactly one buffer.
+    M, N, K, BLOCK_K = 16, 16, 256, 32
+    torch.manual_seed(0)
+    a = torch.randn((M, K), device=device, dtype=dtype)
+    x = torch.randn((K, N), device=device, dtype=dtype)
+    y = -torch.rand((K, N), device=device, dtype=dtype)
+    out = torch.empty((M, N), device=device, dtype=torch.float32)
+    precision = "ieee" if dtype == torch.float32 else "tf32"
+    kernel = converging_operand_matmul_kernel[(1, )](a, x, y, out, K, BLOCK_M=M, BLOCK_N=N, BLOCK_K=BLOCK_K,
+                                                     NUM_STAGES=num_stages, INPUT_PRECISION=precision,
+                                                     num_warps=num_warps)
+    ref = a.float() @ (x.float() * torch.exp2(y.float())).to(dtype).float()
+    tolerance = 1e-4 if dtype == torch.float32 else 5e-2
+    torch.testing.assert_close(out, ref, atol=tolerance, rtol=tolerance)
+    # A second buffer for the operand would be filled from the first one; where
+    # the copy runs before the store, the dot reads tiles of earlier iterations.
+    ttgir = kernel.asm["ttgir"]
+    shared_loads = set(re.findall(r"(%[\w.]+) = ttg\.local_load", ttgir))
+    shared_stores = re.findall(r"ttg\.local_store (%[\w.]+),", ttgir)
+    assert not shared_loads.intersection(shared_stores), "shared buffer filled from another shared buffer"
