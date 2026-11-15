@@ -753,16 +753,66 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 
 // -----
 
+// Before Volta there are no tensor cores: the dot falls back to FMA.
 #blocked = #ttg.blocked<{sizePerThread = [4, 4], threadsPerWarp = [1, 32], warpsPerCTA = [4, 2], order = [1, 0]}>
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "cuda:75", "ttg.threads-per-warp" = 32 : i32} {
-  // CHECK-LABEL: dot_fall_back_fma_before_ampere
-  tt.func public @dot_fall_back_fma_before_ampere(%arg0: tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #blocked}>>, %arg1: tensor<64x256xf16, #ttg.dot_op<{opIdx = 1, parent = #blocked}>>, %arg2: tensor<128x256x!tt.ptr<f32>, #blocked>) {
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "cuda:61", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: dot_fall_back_fma_before_volta
+  tt.func public @dot_fall_back_fma_before_volta(%arg0: tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #blocked}>>, %arg1: tensor<64x256xf16, #ttg.dot_op<{opIdx = 1, parent = #blocked}>>, %arg2: tensor<128x256x!tt.ptr<f32>, #blocked>) {
     %cst = arith.constant dense<0.000000e+00> : tensor<128x256xf32, #blocked>
     // CHECK:   %[[EXT0:.*]] = arith.extf %arg0
     // CHECK:   %[[EXT1:.*]] = arith.extf %arg1
     // CHECK:   %[[DOT:.*]] = tt.dot %[[EXT0]], %[[EXT1]]
     %0 = tt.dot %arg0, %arg1, %cst, inputPrecision = tf32 : tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #blocked}>> * tensor<64x256xf16, #ttg.dot_op<{opIdx = 1, parent = #blocked}>> -> tensor<128x256xf32, #blocked>
     // CHECK:   tt.store %arg2, %[[DOT]]
+    tt.store %arg2, %0 : tensor<128x256x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+// Turing has no bf16 tensor-core instruction: bf16 dots stay on FMA.
+#blocked = #ttg.blocked<{sizePerThread = [4, 4], threadsPerWarp = [1, 32], warpsPerCTA = [4, 2], order = [1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "cuda:75", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: dot_bf16_fall_back_fma_on_turing
+  tt.func public @dot_bf16_fall_back_fma_on_turing(%arg0: tensor<128x64xbf16, #ttg.dot_op<{opIdx = 0, parent = #blocked}>>, %arg1: tensor<64x256xbf16, #ttg.dot_op<{opIdx = 1, parent = #blocked}>>, %arg2: tensor<128x256x!tt.ptr<f32>, #blocked>) {
+    %cst = arith.constant dense<0.000000e+00> : tensor<128x256xf32, #blocked>
+    // CHECK-NOT: ttg.nvidia_mma
+    // CHECK:   %[[EXT0:.*]] = arith.extf %arg0
+    // CHECK:   %[[EXT1:.*]] = arith.extf %arg1
+    // CHECK:   %[[DOT:.*]] = tt.dot %[[EXT0]], %[[EXT1]]
+    %0 = tt.dot %arg0, %arg1, %cst, inputPrecision = tf32 : tensor<128x64xbf16, #ttg.dot_op<{opIdx = 0, parent = #blocked}>> * tensor<64x256xbf16, #ttg.dot_op<{opIdx = 1, parent = #blocked}>> -> tensor<128x256xf32, #blocked>
+    tt.store %arg2, %0 : tensor<128x256x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+// fp16 dots with fp32 accumulators run on tensor cores: MMAv2 on Turing, MMAv1 on Volta.
+#blocked = #ttg.blocked<{sizePerThread = [4, 4], threadsPerWarp = [1, 32], warpsPerCTA = [4, 2], order = [1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "cuda:75", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK: #[[MMA2:.*]] = #ttg.nvidia_mma<{versionMajor = 2
+  // CHECK-LABEL: dot_fp16_mma_on_turing
+  tt.func public @dot_fp16_mma_on_turing(%arg0: tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #blocked}>>, %arg1: tensor<64x256xf16, #ttg.dot_op<{opIdx = 1, parent = #blocked}>>, %arg2: tensor<128x256x!tt.ptr<f32>, #blocked>) {
+    %cst = arith.constant dense<0.000000e+00> : tensor<128x256xf32, #blocked>
+    // CHECK: tt.dot {{.*}} -> tensor<128x256xf32, #[[MMA2]]>
+    %0 = tt.dot %arg0, %arg1, %cst, inputPrecision = tf32 : tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #blocked}>> * tensor<64x256xf16, #ttg.dot_op<{opIdx = 1, parent = #blocked}>> -> tensor<128x256xf32, #blocked>
+    tt.store %arg2, %0 : tensor<128x256x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [4, 4], threadsPerWarp = [1, 32], warpsPerCTA = [4, 2], order = [1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "cuda:70", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK: #[[MMA1:.*]] = #ttg.nvidia_mma<{versionMajor = 1
+  // CHECK-LABEL: dot_fp16_mma_on_volta
+  tt.func public @dot_fp16_mma_on_volta(%arg0: tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #blocked}>>, %arg1: tensor<64x256xf16, #ttg.dot_op<{opIdx = 1, parent = #blocked}>>, %arg2: tensor<128x256x!tt.ptr<f32>, #blocked>) {
+    %cst = arith.constant dense<0.000000e+00> : tensor<128x256xf32, #blocked>
+    // CHECK: tt.dot {{.*}} -> tensor<128x256xf32, #[[MMA1]]>
+    %0 = tt.dot %arg0, %arg1, %cst, inputPrecision = tf32 : tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #blocked}>> * tensor<64x256xf16, #ttg.dot_op<{opIdx = 1, parent = #blocked}>> -> tensor<128x256xf32, #blocked>
     tt.store %arg2, %0 : tensor<128x256x!tt.ptr<f32>, #blocked>
     tt.return
   }

@@ -12,7 +12,8 @@
 
 // -----
 
-// expected-error@+2 {{ttg.dot_op kWidth parameter can only be non-zero for Ampere or Hopper MMA parent}}
+// Volta operands hold four k values (kWidth 4) or four m/n values at one k (kWidth 1).
+// expected-error@+2 {{ttg.dot_op kWidth parameter must be 4 or 1 for a Volta MMA parent}}
 #mma = #ttg.nvidia_mma<{versionMajor = 1, warpsPerCTA = [1, 1], instrShape = [16, 8]}>
 #dot_op = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>
 
