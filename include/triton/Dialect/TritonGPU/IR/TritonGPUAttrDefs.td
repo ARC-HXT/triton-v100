@@ -147,7 +147,7 @@ When vec=2, elements are swizzled in pairs of 2.  In other words, the element at
         // phase has to run over the tile's extent in that dimension (Ampere
         // uses 8), or rows r and r + 8 share their banks.
         if (mmaEnc.isVolta()) {
-          int K = getShapePerCTA(CTALayout.getCTASplitNum(), shape)[order[0]];
+          int K = getShapePerCTA(CGALayout.getCTASplitNum(), shape)[order[0]];
           int perPhase = std::max<int>(1024 / (typeWidthInBit * K), 1);
           int vec = 4;
           auto instrShape = mmaEnc.getInstrShape();
@@ -163,7 +163,7 @@ When vec=2, elements are swizzled in pairs of 2.  In other words, the element at
           int maxPhase = std::max(
               std::min<int>(mmaStride, 1024 / (vec * typeWidthInBit)), 1);
           maxPhase = std::max(maxPhase / perPhase, 1);
-          return get(context, vec, perPhase, maxPhase, order, CTALayout);
+          return get(context, vec, perPhase, maxPhase, order, CGALayout);
         }
 
         // ---- begin Ampere & Hopper ----

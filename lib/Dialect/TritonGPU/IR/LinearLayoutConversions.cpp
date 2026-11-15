@@ -1141,7 +1141,7 @@ NvidiaMmaEncodingAttr::toLinearLayout(ArrayRef<int64_t> shape) const {
         identityStandardND(S("warp"), getWarpsPerCTA(),
                            getMatrixOrder(rank, /*rowMajor*/ true))
             .transposeOuts(llvm::to_vector(ctaLayout.getOutDimNames()));
-    return combineCtaCgaWithShape(ctaLayout, getCTALayout(), shape);
+    return combineCtaCgaWithShape(ctaLayout, getCGALayout(), shape);
   }
 
   SmallVector<unsigned> tileShape;
@@ -1182,7 +1182,7 @@ LinearLayout nvidiaDotToLinearLayout(ArrayRef<int64_t> shape,
                                     getMatrixOrder(rank, /*rowMajor*/ true),
                                     isA ? rank - 1 : rank - 2, S("warp"))
             .transposeOuts(llvm::to_vector(ctaLayout.getOutDimNames()));
-    return combineCtaCgaWithShape(ctaLayout, getCTALayout(dot), shape);
+    return combineCtaCgaWithShape(ctaLayout, getCGALayout(dot), shape);
   }
 
   SmallVector<unsigned> tileShape(rank, 1);
