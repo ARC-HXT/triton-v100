@@ -1309,7 +1309,7 @@ bool LayoutRematerialization::hoistConvertDotOperand(
     auto freeMasks = toLinearLayout(targetType).getFreeVariableMasks();
     MLIRContext *ctx = convertOp.getContext();
     if (freeMasks.lookup(StringAttr::get(ctx, "lane")) != 0)
-      return;
+      return false;
     warpShared = freeMasks.lookup(StringAttr::get(ctx, "warp")) != 0;
   }
   // In Volta's 8x32 decode tile an operand held by one thread per element and
@@ -1350,13 +1350,18 @@ bool LayoutRematerialization::hoistConvertDotOperand(
   auto addDirectLoad = [&](LoadOp load, Attribute encoding) -> bool {
     SetVector<Value> loadSlice;
     DenseMap<Value, Attribute> loadLayout;
+    // A value that already has a rematerialization is left out of the slice
+    // (3.8); the address chain is only recomputed when it is complete.
+    DenseMap<std::pair<Value, Attribute>, Value> loadRemats;
     for (OpOperand &operand : load->getOpOperands()) {
       if (!isa<RankedTensorType>(operand.get().getType()))
         continue;
       if (failed(getConvertBackwardSlice(operand, encoding, loadSlice,
-                                         loadLayout, nullptr)))
+                                         loadLayout, loadRemats, nullptr)))
         return false;
     }
+    if (llvm::any_of(loadRemats, [](auto &entry) { return entry.second; }))
+      return false;
     for (Value value : loadSlice) {
       Operation *op = value.getDefiningOp();
       if (!op || !(noDataMovement(op) ||
@@ -1398,7 +1403,7 @@ bool LayoutRematerialization::hoistConvertDotOperand(
         return loadLeaf(v.getDefiningOp()) &&
                !isa<DotOperandEncodingAttr>(layout[v]);
       }))
-    return;
+    return false;
 
   IRMapping mapping;
   OpBuilder builder(convertOp.getContext());
